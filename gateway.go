@@ -1,6 +1,7 @@
 package discordbot
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -106,7 +107,6 @@ func (g *DiscordGateway) Connect() (err error) {
 
 	// First message should be a hello with heartbeat details.
 	helloResp := new(gatewayPayload)
-	helloResp.EventData = new(gatewayHelloResponse)
 	err = g.conn.ReadJSON(helloResp)
 
 	if err != nil {
@@ -118,11 +118,13 @@ func (g *DiscordGateway) Connect() (err error) {
 		return fmt.Errorf("not a hello opcode. Instead got message [%+v]", helloResp)
 	}
 
-	helloMessage, ok := helloResp.EventData.(*gatewayHelloResponse)
+	helloMessage := gatewayHelloResponse{}
+	err = json.Unmarshal(helloResp.EventData, &helloMessage)
 
-	if !ok {
+	if err != nil {
 		return fmt.Errorf("unable to parse gateway hello response [%+v]", helloResp.EventData)
 	}
+
 	heartbeatInterval := time.Duration(helloMessage.HeartbeatInterval) * time.Millisecond
 
 	if heartbeatInterval <= 0 {
@@ -205,16 +207,26 @@ func startHeartbeat(heartbeat *discordHeartbeat) {
 
 // https://discordapp.com/developers/docs/topics/gateway#payloads-gateway-payload-structure
 type gatewayPayload struct {
-	Opcode         int         `json:"op"`
-	EventName      string      `json:"t,omitempty"`
-	EventData      interface{} `json:"d"`
-	SequenceNumber *int        `json:"s,omitempty"`
+	Opcode         int             `json:"op"`
+	EventName      string          `json:"t,omitempty"`
+	EventData      json.RawMessage `json:"d"`
+	SequenceNumber *int            `json:"s,omitempty"`
 }
 
 // https://discordapp.com/developers/docs/topics/gateway#hello
 type gatewayHelloResponse struct {
 	HeartbeatInterval int `json:"heartbeat_interval"`
-	// _trace omitted
+	// _trace [] string omitted
+}
+
+// https://discordapp.com/developers/docs/topics/gateway#ready
+type gatewayReadyResponse struct {
+	Version int
+	// User user
+	// PrivateChannels []discordDmChannel `json:"private_channels"`
+	// Guilds []unavailableGuild
+	// SessionId string `json:"session_id"`
+	// _trace []string omitted
 }
 
 type discordHeartbeat struct {

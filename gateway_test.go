@@ -1,6 +1,8 @@
 package discordbot_test
 
 import (
+	"encoding/json"
+	"log"
 	"os"
 	"testing"
 	"time"
@@ -8,7 +10,9 @@ import (
 	"github.com/gdewald/discordbot"
 )
 
-func TestConnect(t *testing.T) {
+// Test should only be run manually - there is a limit on number of identify requests in a time period.
+// TODO: make more generic.
+func TestConnectAndIdentify(t *testing.T) {
 	testToken, ok := os.LookupEnv("TEST_BOT_AUTH_TOKEN")
 	if !ok {
 		t.SkipNow()
@@ -21,18 +25,64 @@ func TestConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gateway := discordbot.DiscordGateway{
+	gateway := &discordbot.DiscordGateway{
 		DiscordClient: client,
 		GatewayInfo:   gatewayInfo,
 	}
 
 	err = gateway.Connect()
 
+	gateway.RegisterEventListener(discordbot.EventGuildCreate, func(payload discordbot.GatewayPayload) {
+		log.Print("Event listener called.")
+		eventData := payload.EventData
+
+		guildCreate := discordbot.Guild{}
+		json.Unmarshal(eventData, &guildCreate)
+		log.Printf("Guild create: %+v", guildCreate)
+
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		if channels := *guildCreate.Channels; channels != nil {
+			message := discordbot.OutgoingMessage{
+				Content: "3 monitors and a neck beard.",
+				Tts:     false,
+			}
+			log.Printf("Sending message: %+v", message)
+
+			for _, channel := range channels {
+				if channel.Name != nil && *channel.Name == "general" {
+					sentMessage, err := client.SendMessage(channel.Id, message)
+
+					if err != nil {
+						log.Print(err)
+						return
+					}
+
+					log.Print(sentMessage)
+
+				}
+			}
+		} else {
+			log.Print("No channels!")
+		}
+	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	time.Sleep(time.Duration(10) * time.Second)
+	t.Log(gateway)
 
-	t.Log(gateway, err)
+	user, err := gateway.Identify(nil)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log(user)
+
+	time.Sleep(time.Duration(5) * time.Minute)
 }

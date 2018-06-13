@@ -23,8 +23,8 @@ const botGetGatewayEndpoint = "/gateway/bot"
 // Gateway connection details.
 // https://discordapp.com/developers/docs/topics/gateway#get-gateway-bot
 type gatewayInfo struct {
-	Url    string
-	Shards int
+	Url    string `json:"url"`
+	Shards int    `json:"shards"`
 }
 
 func (client *DiscordClient) GetGateway() (gateway gatewayInfo, err error) {

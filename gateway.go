@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -74,20 +76,67 @@ type DiscordGateway struct {
 	DiscordClient
 	GatewayInfo gatewayInfo
 	// TODO: use sync.Map
-	listeners map[int][]GatewayMessageListener
-	conn      *websocket.Conn
-	heartbeat *discordHeartbeat
+	opcodeListeners map[int][]GatewayMessageListener
+	eventListeners  map[string][]GatewayMessageListener
+	conn            *websocket.Conn
+	connMutex       *sync.Mutex
+	heartbeat       *discordHeartbeat
+	sessionId       *string
+	sequenceNumber  *int
 }
 
-type GatewayMessageListener func(gatewayPayload)
+func (g *DiscordGateway) SendPayload(payload *GatewayPayload) (err error) {
+	g.connMutex.Lock()
 
-func (g *DiscordGateway) RegisterOpcodeListener(opcode int, listener GatewayMessageListener) {
-	if g.listeners == nil {
-		g.listeners = make(map[int][]GatewayMessageListener)
+	log.Printf("Sending payload with Opcode [%v], event name [%s], data [%s], and sequenceNum [%v].",
+		payload.Opcode, payload.EventName, payload.EventData, payload.SequenceNumber)
+	err = g.conn.WriteJSON(payload)
+	if err != nil {
+		log.Print("Error during send.", err)
+	} else {
+		log.Printf("Done.")
 	}
-	g.listeners[opcode] = append(g.listeners[opcode], listener)
+
+	g.connMutex.Unlock()
+	return
 }
 
+func (g *DiscordGateway) SendControl(messageType int, data []byte, deadline time.Time) (err error) {
+	g.connMutex.Lock()
+
+	err = g.conn.WriteControl(messageType, data, deadline)
+
+	g.connMutex.Unlock()
+	return
+}
+
+// Reference: https://discordapp.com/developers/docs/topics/gateway#payloads-gateway-payload-structure
+type GatewayPayload struct {
+	Opcode         int             `json:"op"`
+	EventName      string          `json:"t,omitempty"`
+	EventData      json.RawMessage `json:"d"`
+	SequenceNumber *int            `json:"s,omitempty"`
+}
+
+type GatewayMessageListener func(GatewayPayload)
+
+// Register listener that is called when the opcode is received.
+func (g *DiscordGateway) RegisterOpcodeListener(opcode int, listener GatewayMessageListener) {
+	if g.opcodeListeners == nil {
+		g.opcodeListeners = make(map[int][]GatewayMessageListener)
+	}
+	g.opcodeListeners[opcode] = append(g.opcodeListeners[opcode], listener)
+}
+
+// Register listener that is called when a named event is received (OpcodeDispatch only).
+func (g *DiscordGateway) RegisterEventListener(event string, listener GatewayMessageListener) {
+	if g.eventListeners == nil {
+		g.eventListeners = make(map[string][]GatewayMessageListener)
+	}
+	g.eventListeners[event] = append(g.eventListeners[event], listener)
+}
+
+// Connects to gateway, starts heartbeat, initializes listeners for gateway.
 func (g *DiscordGateway) Connect() (err error) {
 	dialer := websocket.Dialer{}
 
@@ -99,6 +148,7 @@ func (g *DiscordGateway) Connect() (err error) {
 
 	var resp *http.Response
 	g.conn, resp, err = dialer.Dial(connectUrl, connectHeader)
+	g.connMutex = new(sync.Mutex)
 	log.Printf("Response: [%+v].", resp)
 
 	if err != nil {
@@ -106,7 +156,7 @@ func (g *DiscordGateway) Connect() (err error) {
 	}
 
 	// First message should be a hello with heartbeat details.
-	helloResp := new(gatewayPayload)
+	helloResp := new(GatewayPayload)
 	err = g.conn.ReadJSON(helloResp)
 
 	if err != nil {
@@ -132,26 +182,41 @@ func (g *DiscordGateway) Connect() (err error) {
 	}
 
 	g.heartbeat = &discordHeartbeat{
-		conn:     g.conn,
+		gateway:  g,
 		interval: heartbeatInterval,
+		getSequenceNum: func() *int {
+			return g.sequenceNumber
+		},
 	}
 
 	startHeartbeat(g.heartbeat)
 	g.RegisterOpcodeListener(OpcodeHeartbeatACK, g.heartbeat.heartbeatAckRecv)
 	g.RegisterOpcodeListener(OpcodeHeartbeat, g.heartbeat.heartbeatRecv)
 
+	g.RegisterOpcodeListener(OpcodeDispatch, func(payload GatewayPayload) {
+		g.sequenceNumber = payload.SequenceNumber
+		listeners := g.eventListeners[payload.EventName]
+		log.Printf("Found [%d] listeners for event [%v]", len(listeners), payload.EventName)
+		for _, eventListener := range listeners {
+			log.Print("Calling event listener.", eventListener)
+			go eventListener(payload)
+		}
+	})
+
 	go func() {
 		for {
-			payload := gatewayPayload{}
+			payload := GatewayPayload{}
 			err := g.conn.ReadJSON(&payload)
 
 			if err != nil {
 				log.Fatal("Failure reading message.", err)
 			}
 
-			log.Printf("Received payload [%+v].", payload)
+			log.Printf("Received payload with Opcode [%v], event name [%s], data [%s], and sequenceNum [%v].",
+				payload.Opcode, payload.EventName, payload.EventData, payload.SequenceNumber)
 
-			for _, opcodeListener := range g.listeners[payload.Opcode] {
+			log.Printf("Found [%d] listeners for opcode", len(g.opcodeListeners[payload.Opcode]))
+			for _, opcodeListener := range g.opcodeListeners[payload.Opcode] {
 				go opcodeListener(payload)
 			}
 		}
@@ -160,93 +225,118 @@ func (g *DiscordGateway) Connect() (err error) {
 	return
 }
 
-const closeTimeoutSeconds = time.Duration(5) * time.Second
+// TODO: verify this works.
+type GatewayTrace struct {
+	Trace []string `json:"_trace"`
+}
 
-// TODO: retry functionality
-func startHeartbeat(heartbeat *discordHeartbeat) {
-	heartbeat.heartbeatAck = make(chan *int)
-	heartbeatMessage := gatewayPayload{
-		Opcode: OpcodeHeartbeat,
+// Reference: https://discordapp.com/developers/docs/topics/gateway#hello-hello-structure
+type gatewayHelloResponse struct {
+	GatewayTrace
+	HeartbeatInterval int `json:"heartbeat_interval"`
+}
+
+// Reference: https://discordapp.com/developers/docs/topics/gateway#identify-identify-connection-properties
+type gatewayConnectionProperties struct {
+	Os      string `json:"$os"`
+	Browser string `json:"$browser"`
+	Device  string `json:"$device"`
+}
+
+// Reference: https://discordapp.com/developers/docs/topics/gateway#update-status-gateway-status-update-structure
+type GatewayStatusUpdate struct {
+	Since int `json:"since"`
+	// Game *Activity
+	Status string `json:"status"`
+	Afk    bool   `json:"afk"`
+}
+
+// Reference: https://discordapp.com/developers/docs/topics/gateway#update-status-status-types
+const (
+	StatusOnline       = "online"
+	StatusDoNotDisturb = "dnd"
+	StatusIdle         = "idle"
+	StatusInvisible    = "invisible"
+	StatusOffline      = "offline"
+)
+
+// Identify should be called once heartbeat is established.
+// Reference: https://discordapp.com/developers/docs/topics/gateway#identify-identify-structure
+type gatewayIdentifyRequest struct {
+	Token          string                      `json:"token"`
+	Properties     gatewayConnectionProperties `json:"properties"`
+	Compress       *bool                       `json:",omitempty"`
+	LargeThreshold *int                        `json:"large_threshold"`
+	Shard          *[]int                      `json:",omitempty"`
+	Presence       *GatewayStatusUpdate        `json:",omitempty"`
+}
+
+// Ready is the event corresponding to the identify request.
+// Reference: https://discordapp.com/developers/docs/topics/gateway#ready-ready-event-fields
+type gatewayReadyResponse struct {
+	GatewayTrace
+	Version         int
+	User            User
+	PrivateChannels []Channel `json:"private_channels"`
+	Guilds          []UnavailableGuild
+	SessionId       string `json:"session_id"`
+}
+
+// How long to wait before giving up on identify event.
+const identifyTimeoutSeconds = time.Duration(30) * time.Second
+
+// Enable for packet compression over connection (used in identify request).
+const enablePacketCompression = false
+
+// Sends identify to server and returns user from the ready response.
+func (g *DiscordGateway) Identify(initialStatus *GatewayStatusUpdate) (user User, err error) {
+
+	compress := enablePacketCompression
+	identifyRequest := gatewayIdentifyRequest{
+		Token: g.AuthToken,
+		Properties: gatewayConnectionProperties{
+			Os:      runtime.GOOS,
+			Browser: "none",
+			Device:  "computer",
+		},
+		Compress: &compress,
+		Presence: initialStatus,
 	}
 
-	go func() {
-		log.Printf("Starting heartbeat with interval: [%v].", heartbeat.interval)
-		for {
-			heartbeatMessage.SequenceNumber = heartbeat.sequenceNum
+	var requestJsonBytes json.RawMessage
+	requestJsonBytes, err = json.Marshal(&identifyRequest)
 
-			log.Print("Sending heartbeat.")
-			err := heartbeat.conn.WriteJSON(heartbeatMessage)
+	if err != nil {
+		return user, fmt.Errorf("failed to marshal identify request: %v", err)
+	}
 
-			if err != nil {
-				log.Fatal("Failed to send heartbeat: ", err)
-			}
+	messageReceieved := make(chan error)
+	readyMessage := gatewayReadyResponse{}
+	g.RegisterEventListener(EventReady, func(readyPayload GatewayPayload) {
+		err = json.Unmarshal(readyPayload.EventData, &readyMessage)
+		messageReceieved <- err
+	})
 
-			lastHeartbeat := time.Now()
+	err = g.SendPayload(&GatewayPayload{
+		Opcode:    OpcodeIdentify,
+		EventData: requestJsonBytes,
+	})
 
-			select {
-			case heartbeatMessage.SequenceNumber = <-heartbeat.heartbeatAck:
-				log.Printf("Received ack with sequence number [%v].", heartbeatMessage.SequenceNumber)
-				timeSinceLast := time.Now().Sub(lastHeartbeat)
-				time.Sleep(heartbeat.interval - timeSinceLast)
-			case <-time.After(heartbeat.interval):
-				err := heartbeat.conn.WriteControl(
-					websocket.CloseMessage,
-					websocket.FormatCloseMessage(CloseSessionTimeout, ""),
-					time.Now().Add(closeTimeoutSeconds),
-				)
+	if err != nil {
+		return user, fmt.Errorf("failed to send identify request: %v", err)
+	}
 
-				if err != nil {
-					log.Printf("gateway failed to close with error: %v", err)
-				}
-
-				log.Fatal("Heartbeat ack not received within time window.")
-			}
+	select {
+	case err = <-messageReceieved:
+		if err != nil {
+			return
 		}
-	}()
-}
 
-// https://discordapp.com/developers/docs/topics/gateway#payloads-gateway-payload-structure
-type gatewayPayload struct {
-	Opcode         int             `json:"op"`
-	EventName      string          `json:"t,omitempty"`
-	EventData      json.RawMessage `json:"d"`
-	SequenceNumber *int            `json:"s,omitempty"`
-}
+		g.sessionId = &readyMessage.SessionId
+		user = readyMessage.User
+	case <-time.After(identifyTimeoutSeconds):
+		err = fmt.Errorf("Failed to get ready response for identify before timeout.")
+	}
 
-// https://discordapp.com/developers/docs/topics/gateway#hello
-type gatewayHelloResponse struct {
-	HeartbeatInterval int `json:"heartbeat_interval"`
-	// _trace [] string omitted
-}
-
-// https://discordapp.com/developers/docs/topics/gateway#ready
-type gatewayReadyResponse struct {
-	Version int
-	// User user
-	// PrivateChannels []discordDmChannel `json:"private_channels"`
-	// Guilds []unavailableGuild
-	// SessionId string `json:"session_id"`
-	// _trace []string omitted
-}
-
-type discordHeartbeat struct {
-	conn          *websocket.Conn
-	interval      time.Duration
-	heartbeatAck  chan *int
-	heartbeat     chan time.Time
-	lastHeartbeat time.Time
-	sequenceNum   *int
-}
-
-// Called when a heartbeat ACK is received. Forwards the current sequence num to the ACK channel.
-func (d *discordHeartbeat) heartbeatAckRecv(gatewayPayload) {
-	log.Print("Received heartbeat ack")
-	d.heartbeatAck <- d.sequenceNum
-}
-
-// Called when a heartbeat is received. Updates the sequence num and responds with an ACK.
-func (d *discordHeartbeat) heartbeatRecv(payload gatewayPayload) {
-	log.Print("Received heartbeat with payload:", payload)
-	d.sequenceNum = payload.SequenceNumber
-	d.conn.WriteJSON(gatewayPayload{Opcode: OpcodeHeartbeatACK})
+	return
 }
